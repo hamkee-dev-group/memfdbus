@@ -56,9 +56,11 @@ copy="$tmp/copy.bin"
 inspect_fd="$tmp/inspect_fd"
 held_fd="$tmp/held_fd"
 api_smoke="$tmp/api_smoke"
+digest_mismatch="$tmp/digest_mismatch"
 "$cc" $cflags -o "$inspect_fd" tests/inspect_fd.c $ldflags
 "$cc" $cflags -o "$held_fd" tests/held_fd.c $ldflags
 "$cc" $cflags -Iinclude -o "$api_smoke" tests/api_smoke.c build/libmemfdbus.a $ldflags
+"$cc" $cflags -Isrc -o "$digest_mismatch" tests/digest_mismatch.c src/sha256.c $ldflags
 python3 - "$payload" <<'PY'
 import pathlib
 import sys
@@ -793,5 +795,24 @@ if "$bin" broker --socket "$tmp/text-backlog.sock" --listen-backlog nope >"$tmp/
 fi
 grep -F -- "--listen-backlog" "$tmp/text-backlog.err" >/dev/null
 test ! -S "$tmp/text-backlog.sock"
+
+digest_sock="$tmp/digest.sock"
+digest_log="$tmp/digest.log"
+start_broker "$digest_sock" "$digest_log"
+"$digest_mismatch" "$digest_sock"
+"$bin" list --socket "$digest_sock" >"$tmp/digest-list.txt"
+if grep -F "mismatch-object" "$tmp/digest-list.txt" >/dev/null; then
+    echo "broker retained an object after digest mismatch" >&2
+    exit 1
+fi
+grep -F "match-object" "$tmp/digest-list.txt" >/dev/null
+if "$bin" get --name mismatch-object "$tmp/digest-mismatch-get.bin" --socket "$digest_sock" \
+    2>"$tmp/digest-mismatch-get.err"; then
+    echo "get unexpectedly succeeded for mismatch-object" >&2
+    exit 1
+fi
+grep -F "object not found" "$tmp/digest-mismatch-get.err" >/dev/null
+"$bin" get --name match-object "$tmp/digest-match-get.bin" --socket "$digest_sock"
+stop_broker
 
 printf 'smoke ok: objects %s, %s, and %s\n' "$id" "$stdin_id" "$id_v2"

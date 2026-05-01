@@ -931,6 +931,53 @@ static int validate_sealed_memfd(int fd, uint64_t claimed_size, char *err, size_
     return 0;
 }
 
+static int verify_fd_digest(int fd, uint64_t size, const char *expected,
+                            char *err, size_t err_len)
+{
+    struct memfdbus_sha256_ctx ctx;
+    unsigned char raw[MEMFDBUS_SHA256_RAW_LEN];
+    char actual[MEMFDBUS_DIGEST_BUFSZ];
+    char *buf = malloc(MFDB_COPY_BUFSZ);
+    uint64_t off = 0;
+
+    if (!buf) {
+        snprintf(err, err_len, "digest verification allocation failed");
+        return -1;
+    }
+    memfdbus_sha256_init(&ctx);
+    while (off < size) {
+        size_t want = MFDB_COPY_BUFSZ;
+        ssize_t n;
+
+        if (size - off < want) {
+            want = (size_t)(size - off);
+        }
+        do {
+            n = pread(fd, buf, want, (off_t)off);
+        } while (n < 0 && errno == EINTR);
+        if (n < 0) {
+            snprintf(err, err_len, "digest verification read failed: %s", strerror(errno));
+            free(buf);
+            return -1;
+        }
+        if (n == 0) {
+            snprintf(err, err_len, "digest verification short read");
+            free(buf);
+            return -1;
+        }
+        memfdbus_sha256_update(&ctx, buf, (size_t)n);
+        off += (uint64_t)n;
+    }
+    free(buf);
+    memfdbus_sha256_final(&ctx, raw);
+    memfdbus_sha256_format(actual, raw);
+    if (strcmp(actual, expected) != 0) {
+        snprintf(err, err_len, "digest mismatch");
+        return -1;
+    }
+    return 0;
+}
+
 static int reopen_object_fd(int fd)
 {
     char path[64];
@@ -1092,6 +1139,17 @@ static void handle_put(int client, struct object_store *store, const struct mfdb
     }
 
     if (validate_sealed_memfd(fd, req->size, err, sizeof(err)) < 0) {
+        close_nointr(fd);
+        broker_log_event_detail("put", "bad_request", 0, name, &req->size, digest, owner_job,
+                                "name", err, NULL);
+        free(allowed_job);
+        free(name);
+        free(owner_job);
+        send_error(client, MFDB_CMD_PUT, MFDB_BAD_REQUEST, err);
+        return;
+    }
+
+    if (verify_fd_digest(fd, req->size, digest, err, sizeof(err)) < 0) {
         close_nointr(fd);
         broker_log_event_detail("put", "bad_request", 0, name, &req->size, digest, owner_job,
                                 "name", err, NULL);
