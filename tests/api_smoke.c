@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #ifndef F_GET_SEALS
@@ -30,6 +31,14 @@
 
 #ifndef F_SEAL_WRITE
 #define F_SEAL_WRITE 0x0008
+#endif
+
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+
+#ifndef MFD_ALLOW_SEALING
+#define MFD_ALLOW_SEALING 0x0002U
 #endif
 
 static void fail_api(const char *what, const struct memfdbus_error *err)
@@ -471,6 +480,107 @@ int main(int argc, char **argv)
     if (ret != MEMFDBUS_RESULT_NOT_FOUND) {
         fprintf(stderr, "expected not found after drop, got %d\n", ret);
         return 1;
+    }
+
+    {
+        struct memfdbus_error neg_err = {0};
+        struct stat regfile_st;
+        uint64_t neg_id = 0;
+        int closed_fd;
+        int pipefd[2];
+        int regfile_fd;
+        int unsealed_memfd;
+
+        ret = memfdbus_put_fd_for_job(argv[1], -1, "bad-fd", NULL, NULL, &neg_id, &neg_err);
+        if (ret != MEMFDBUS_RESULT_BAD_REQUEST || neg_err.code != MEMFDBUS_RESULT_BAD_REQUEST ||
+            neg_err.sys_errno != EBADF ||
+            !strstr(memfdbus_error_message(&neg_err), "invalid input fd")) {
+            fprintf(stderr,
+                    "expected BAD_REQUEST/EBADF for put_fd_for_job(-1), got %d/%d (%s)\n",
+                    ret, neg_err.sys_errno, memfdbus_error_message(&neg_err));
+            return 1;
+        }
+
+        memset(&neg_err, 0, sizeof(neg_err));
+        ret = memfdbus_validate_fd(-1, 0, &neg_err);
+        if (ret != MEMFDBUS_RESULT_BAD_REQUEST || neg_err.code != MEMFDBUS_RESULT_BAD_REQUEST ||
+            neg_err.sys_errno != EBADF ||
+            !strstr(memfdbus_error_message(&neg_err), "invalid object fd")) {
+            fprintf(stderr,
+                    "expected BAD_REQUEST/EBADF for validate_fd(-1), got %d/%d (%s)\n",
+                    ret, neg_err.sys_errno, memfdbus_error_message(&neg_err));
+            return 1;
+        }
+
+        closed_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (closed_fd < 0) {
+            fail_errno("open /dev/null");
+        }
+        if (close(closed_fd) < 0) {
+            fail_errno("close /dev/null");
+        }
+        memset(&neg_err, 0, sizeof(neg_err));
+        ret = memfdbus_validate_fd(closed_fd, 0, &neg_err);
+        if (ret != MEMFDBUS_RESULT_BAD_REQUEST || neg_err.code != MEMFDBUS_RESULT_BAD_REQUEST ||
+            neg_err.sys_errno != EBADF ||
+            !strstr(memfdbus_error_message(&neg_err), "invalid object fd")) {
+            fprintf(stderr,
+                    "expected BAD_REQUEST/EBADF for closed fd, got %d/%d (%s)\n",
+                    ret, neg_err.sys_errno, memfdbus_error_message(&neg_err));
+            return 1;
+        }
+
+        if (pipe(pipefd) < 0) {
+            fail_errno("pipe");
+        }
+        memset(&neg_err, 0, sizeof(neg_err));
+        ret = memfdbus_validate_fd(pipefd[0], 0, &neg_err);
+        if (ret != MEMFDBUS_RESULT_BAD_REQUEST || neg_err.code != MEMFDBUS_RESULT_BAD_REQUEST ||
+            neg_err.sys_errno != EINVAL ||
+            !strstr(memfdbus_error_message(&neg_err), "not a regular memfd-like file")) {
+            fprintf(stderr,
+                    "expected BAD_REQUEST for pipe fd, got %d/%d (%s)\n",
+                    ret, neg_err.sys_errno, memfdbus_error_message(&neg_err));
+            return 1;
+        }
+        close(pipefd[0]);
+        close(pipefd[1]);
+
+        regfile_fd = open("/etc/hostname", O_RDONLY | O_CLOEXEC);
+        if (regfile_fd < 0) {
+            fail_errno("open /etc/hostname");
+        }
+        if (fstat(regfile_fd, &regfile_st) < 0) {
+            fail_errno("fstat /etc/hostname");
+        }
+        memset(&neg_err, 0, sizeof(neg_err));
+        ret = memfdbus_validate_fd(regfile_fd, (uint64_t)regfile_st.st_size, &neg_err);
+        if (ret != MEMFDBUS_RESULT_BAD_REQUEST || neg_err.code != MEMFDBUS_RESULT_BAD_REQUEST ||
+            neg_err.sys_errno != EINVAL ||
+            !strstr(memfdbus_error_message(&neg_err), "descriptor is not a sealed memfd")) {
+            fprintf(stderr,
+                    "expected BAD_REQUEST/EINVAL for regular file, got %d/%d (%s)\n",
+                    ret, neg_err.sys_errno, memfdbus_error_message(&neg_err));
+            return 1;
+        }
+        close(regfile_fd);
+
+        unsealed_memfd = (int)syscall(SYS_memfd_create, "unsealed",
+                                      MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        if (unsealed_memfd < 0) {
+            fail_errno("memfd_create unsealed");
+        }
+        memset(&neg_err, 0, sizeof(neg_err));
+        ret = memfdbus_validate_fd(unsealed_memfd, 0, &neg_err);
+        if (ret != MEMFDBUS_RESULT_BAD_REQUEST || neg_err.code != MEMFDBUS_RESULT_BAD_REQUEST ||
+            neg_err.sys_errno != EINVAL ||
+            !strstr(memfdbus_error_message(&neg_err), "fd is not fully immutable-sealed")) {
+            fprintf(stderr,
+                    "expected BAD_REQUEST/EINVAL for unsealed memfd, got %d/%d (%s)\n",
+                    ret, neg_err.sys_errno, memfdbus_error_message(&neg_err));
+            return 1;
+        }
+        close(unsealed_memfd);
     }
 
     return 0;

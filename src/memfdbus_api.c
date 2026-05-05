@@ -473,6 +473,9 @@ int memfdbus_validate_fd(int fd, uint64_t expected_size, struct memfdbus_error *
         return set_error(err, MEMFDBUS_RESULT_BAD_REQUEST, EBADF, "invalid object fd");
     }
     if (fstat(fd, &st) < 0) {
+        if (errno == EBADF) {
+            return set_error(err, MEMFDBUS_RESULT_BAD_REQUEST, EBADF, "invalid object fd");
+        }
         return set_errno_error(err, "fstat");
     }
     if (!S_ISREG(st.st_mode)) {
@@ -486,6 +489,10 @@ int memfdbus_validate_fd(int fd, uint64_t expected_size, struct memfdbus_error *
     }
     seals = fcntl(fd, F_GET_SEALS);
     if (seals < 0) {
+        if (errno == EINVAL) {
+            return set_error(err, MEMFDBUS_RESULT_BAD_REQUEST, EINVAL,
+                             "descriptor is not a sealed memfd");
+        }
         return set_errno_error(err, "F_GET_SEALS");
     }
     if ((seals & required) != required) {
@@ -580,6 +587,9 @@ int memfdbus_put_fd_for_job(const char *socket_path, int input_fd, const char *n
     int resp_fd = -1;
     int ret;
 
+    if (input_fd < 0) {
+        return set_error(err, MEMFDBUS_RESULT_BAD_REQUEST, EBADF, "invalid input fd");
+    }
     job_id = resolve_job_id(job_id);
     if (name_len == UINT32_MAX) {
         return err ? err->code : MEMFDBUS_RESULT_BAD_REQUEST;
