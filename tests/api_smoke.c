@@ -278,10 +278,46 @@ int main(int argc, char **argv)
     }
     compare_mapping(mapped, object.size, argv[2]);
     munmap(mapped, (size_t)object.size);
-    memfdbus_object_close(&object);
-    if (object.digest[0] != '\0') {
-        fprintf(stderr, "memfdbus_object_close did not clear digest\n");
-        return 1;
+    {
+        struct memfdbus_object zero_object = {0};
+        struct stat stdin_st;
+        int saved_fd = object.fd;
+
+        if (fstat(STDIN_FILENO, &stdin_st) < 0) {
+            fail_errno("fstat stdin pre-close");
+        }
+        memfdbus_object_close(&zero_object);
+        if (fstat(STDIN_FILENO, &stdin_st) < 0) {
+            fprintf(stderr, "memfdbus_object_close on zero-init closed STDIN_FILENO\n");
+            return 1;
+        }
+        if (zero_object.fd != -1 || zero_object.id != 0 || zero_object.size != 0 ||
+            zero_object.digest[0] != '\0' || zero_object.name != NULL) {
+            fprintf(stderr, "zero-init close did not normalize fields\n");
+            return 1;
+        }
+        memfdbus_object_close(&zero_object);
+        if (fstat(STDIN_FILENO, &stdin_st) < 0) {
+            fprintf(stderr, "repeated zero-init close closed STDIN_FILENO\n");
+            return 1;
+        }
+
+        if (saved_fd <= 0) {
+            fprintf(stderr, "expected get to return a non-stdin fd, got %d\n", saved_fd);
+            return 1;
+        }
+        memfdbus_object_close(&object);
+        if (object.fd != -1 || object.id != 0 || object.size != 0 ||
+            object.digest[0] != '\0' || object.name != NULL) {
+            fprintf(stderr, "memfdbus_object_close did not clear fields\n");
+            return 1;
+        }
+        errno = 0;
+        if (fcntl(saved_fd, F_GETFD) >= 0 || errno != EBADF) {
+            fprintf(stderr, "memfdbus_object_close did not close the held fd\n");
+            return 1;
+        }
+        memfdbus_object_close(&object);
     }
 
     ret = memfdbus_get_fd(argv[1], 0, "api-object-copy", &object_copy, &err);

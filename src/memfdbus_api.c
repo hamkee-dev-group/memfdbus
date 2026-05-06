@@ -1031,7 +1031,9 @@ void memfdbus_object_close(struct memfdbus_object *object)
     if (!object) {
         return;
     }
-    close_nointr(object->fd);
+    if (object->fd > 0) {
+        close_nointr(object->fd);
+    }
     free(object->name);
     object->id = 0;
     object->size = 0;
