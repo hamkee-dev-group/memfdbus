@@ -198,6 +198,129 @@ static void expect_digest(const char *digest)
     }
 }
 
+static void verify_bad_request(int ret, const struct memfdbus_error *err, const char *what)
+{
+    if (ret != MEMFDBUS_RESULT_BAD_REQUEST) {
+        fprintf(stderr, "%s: expected BAD_REQUEST return, got %d\n", what, ret);
+        exit(1);
+    }
+    if (err->code != MEMFDBUS_RESULT_BAD_REQUEST) {
+        fprintf(stderr, "%s: expected err.code BAD_REQUEST, got %d\n", what, err->code);
+        exit(1);
+    }
+    if (err->message[0] == '\0') {
+        fprintf(stderr, "%s: expected non-empty err.message\n", what);
+        exit(1);
+    }
+}
+
+static void verify_argument_validation(const char *socket_path)
+{
+    const uint64_t sentinel_id = 0xdeadbeefcafef00dULL;
+    struct memfdbus_error err;
+    struct memfdbus_object obj;
+    uint64_t id;
+    int devnull;
+    int ret;
+
+    unsetenv("MEMFDBUS_JOB_ID");
+
+    memset(&err, 0, sizeof(err));
+    id = sentinel_id;
+    ret = memfdbus_put_file_for_job(socket_path, NULL, "x", NULL, NULL, &id, &err);
+    verify_bad_request(ret, &err, "put_file_for_job(path=NULL)");
+    if (id != sentinel_id) {
+        fprintf(stderr, "put_file_for_job(path=NULL): out_id was modified\n");
+        exit(1);
+    }
+
+    devnull = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (devnull < 0) {
+        fail_errno("open /dev/null");
+    }
+
+    memset(&err, 0, sizeof(err));
+    id = sentinel_id;
+    ret = memfdbus_put_fd_for_job(socket_path, devnull, NULL, NULL, NULL, &id, &err);
+    verify_bad_request(ret, &err, "put_fd_for_job(name=NULL)");
+    if (id != sentinel_id) {
+        fprintf(stderr, "put_fd_for_job(name=NULL): out_id was modified\n");
+        exit(1);
+    }
+
+    memset(&err, 0, sizeof(err));
+    id = sentinel_id;
+    ret = memfdbus_put_fd_for_job(socket_path, devnull, "", NULL, NULL, &id, &err);
+    verify_bad_request(ret, &err, "put_fd_for_job(name=\"\")");
+    if (id != sentinel_id) {
+        fprintf(stderr, "put_fd_for_job(name=\"\"): out_id was modified\n");
+        exit(1);
+    }
+    close(devnull);
+
+    memset(&err, 0, sizeof(err));
+    memset(&obj, 0xcd, sizeof(obj));
+    obj.fd = -1;
+    obj.name = NULL;
+    ret = memfdbus_get_fd_for_job(socket_path, 0, NULL, NULL, &obj, &err);
+    verify_bad_request(ret, &err, "get_fd_for_job(id=0,name=NULL)");
+    if (obj.fd != -1 || obj.name != NULL) {
+        fprintf(stderr, "get_fd_for_job(id=0,name=NULL): out partially initialized\n");
+        exit(1);
+    }
+
+    memset(&err, 0, sizeof(err));
+    memset(&obj, 0xcd, sizeof(obj));
+    obj.fd = -1;
+    obj.name = NULL;
+    ret = memfdbus_get_fd_for_job(socket_path, 1, "x", NULL, &obj, &err);
+    verify_bad_request(ret, &err, "get_fd_for_job(id=1,name=\"x\")");
+    if (obj.fd != -1 || obj.name != NULL) {
+        fprintf(stderr, "get_fd_for_job(id=1,name=\"x\"): out partially initialized\n");
+        exit(1);
+    }
+
+    memset(&err, 0, sizeof(err));
+    ret = memfdbus_get_fd_for_job(socket_path, 0, "any", NULL, NULL, &err);
+    verify_bad_request(ret, &err, "get_fd_for_job(out=NULL)");
+
+    memset(&err, 0, sizeof(err));
+    ret = memfdbus_get_file_for_job(socket_path, 0, "any", NULL, NULL, &err);
+    verify_bad_request(ret, &err, "get_file_for_job(out_path=NULL)");
+
+    memset(&err, 0, sizeof(err));
+    id = sentinel_id;
+    ret = memfdbus_drop_for_job(socket_path, 0, NULL, NULL, &id, &err);
+    verify_bad_request(ret, &err, "drop_for_job(id=0,name=NULL)");
+    if (id != sentinel_id) {
+        fprintf(stderr, "drop_for_job(id=0,name=NULL): out_id was modified\n");
+        exit(1);
+    }
+
+    memset(&err, 0, sizeof(err));
+    id = sentinel_id;
+    ret = memfdbus_drop_for_job(socket_path, 1, "x", NULL, &id, &err);
+    verify_bad_request(ret, &err, "drop_for_job(id=1,name=\"x\")");
+    if (id != sentinel_id) {
+        fprintf(stderr, "drop_for_job(id=1,name=\"x\"): out_id was modified\n");
+        exit(1);
+    }
+
+    memset(&err, 0, sizeof(err));
+    ret = memfdbus_list_for_job(socket_path, NULL, NULL, &err);
+    verify_bad_request(ret, &err, "list_for_job(out=NULL)");
+
+    memset(&err, 0, sizeof(err));
+    id = sentinel_id;
+    ret = memfdbus_put_file_for_job(socket_path, "/dev/null", "x", NULL, "allowed",
+                                    &id, &err);
+    verify_bad_request(ret, &err, "put_file_for_job(allow_job without job_id)");
+    if (id != sentinel_id) {
+        fprintf(stderr, "put_file_for_job(allow_job without job_id): out_id was modified\n");
+        exit(1);
+    }
+}
+
 int main(int argc, char **argv)
 {
     struct memfdbus_error err = {0};
@@ -229,6 +352,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: api_smoke SOCKET PAYLOAD\n");
         return 1;
     }
+
+    verify_argument_validation(argv[1]);
 
     size = file_size(argv[2]);
     ret = memfdbus_put_file(argv[1], argv[2], "api-object", &id, &err);
