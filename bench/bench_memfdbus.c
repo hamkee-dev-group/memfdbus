@@ -12,12 +12,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001U
+#endif
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
 #endif
 
 #define BENCH_OBJECT_NAME "memfdbus-bench"
@@ -71,13 +77,34 @@ static void write_full_or_die(int fd, const void *buf, size_t len)
     const char *p = buf;
 
     while (len > 0) {
-        ssize_t n = write(fd, p, len);
+        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
 
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
             }
             die_errno("write payload");
+        }
+        p += n;
+        len -= (size_t)n;
+    }
+}
+
+static void read_full_or_die(int fd, void *buf, size_t len)
+{
+    char *p = buf;
+
+    while (len > 0) {
+        ssize_t n = read(fd, p, len);
+
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            die_errno("read payload");
+        }
+        if (n == 0) {
+            die("short read: peer closed early");
         }
         p += n;
         len -= (size_t)n;
@@ -92,7 +119,21 @@ static int prepare_input_fd(const unsigned char *payload, size_t size)
         die_errno("memfd_create");
     }
     if (size > 0) {
-        write_full_or_die(fd, payload, size);
+        const char *p = (const char *)payload;
+        size_t left = size;
+
+        while (left > 0) {
+            ssize_t n = write(fd, p, left);
+
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                die_errno("write payload");
+            }
+            p += n;
+            left -= (size_t)n;
+        }
     }
     return fd;
 }
@@ -123,8 +164,8 @@ static void verify_object(const struct memfdbus_object *obj, uint64_t expected_s
     }
 }
 
-static void emit_json(const char *operation, uint64_t payload_size, uint64_t iterations,
-                      uint64_t elapsed_ns)
+static void emit_json(const char *backend, const char *operation, uint64_t payload_size,
+                      uint64_t iterations, uint64_t elapsed_ns)
 {
     double seconds = (double)elapsed_ns / 1e9;
     double throughput = 0.0;
@@ -132,78 +173,25 @@ static void emit_json(const char *operation, uint64_t payload_size, uint64_t ite
     if (seconds > 0.0) {
         throughput = (double)payload_size * (double)iterations / seconds;
     }
-    printf("{\"backend\":\"memfdbus\",\"operation\":\"%s\","
+    printf("{\"backend\":\"%s\",\"operation\":\"%s\","
            "\"payload_size\":%" PRIu64 ",\"iterations\":%" PRIu64 ","
            "\"elapsed_ns\":%" PRIu64 ",\"throughput_bytes_per_sec\":%.3f}\n",
-           operation, payload_size, iterations, elapsed_ns, throughput);
+           backend, operation, payload_size, iterations, elapsed_ns, throughput);
     fflush(stdout);
 }
 
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "usage: %s [--socket PATH] [--size BYTES] [--iterations N]\n",
+            "usage: %s [--socket PATH] [--size BYTES] [--iterations N] "
+            "[--backend memfdbus|unix_stream|all]\n",
             prog);
 }
 
-int main(int argc, char **argv)
+static void run_memfdbus_bench(const char *socket_path, uint64_t size, uint64_t iterations,
+                               const unsigned char *payload)
 {
-    const char *socket_path = MEMFDBUS_DEFAULT_SOCKET;
-    uint64_t size = 4096;
-    uint64_t iterations = 64;
-    static struct option long_opts[] = {
-        {"socket", required_argument, NULL, 's'},
-        {"size", required_argument, NULL, 'z'},
-        {"iterations", required_argument, NULL, 'n'},
-        {"help", no_argument, NULL, 'h'},
-        {0, 0, 0, 0},
-    };
-    int opt;
-
-    while ((opt = getopt_long(argc, argv, "s:z:n:h", long_opts, NULL)) != -1) {
-        char *end = NULL;
-
-        switch (opt) {
-        case 's':
-            socket_path = optarg;
-            break;
-        case 'z':
-            errno = 0;
-            size = strtoull(optarg, &end, 10);
-            if (errno || !end || *end != '\0') {
-                die("invalid --size: %s", optarg);
-            }
-            break;
-        case 'n':
-            errno = 0;
-            iterations = strtoull(optarg, &end, 10);
-            if (errno || !end || *end != '\0') {
-                die("invalid --iterations: %s", optarg);
-            }
-            break;
-        case 'h':
-            usage(argv[0]);
-            return 0;
-        default:
-            usage(argv[0]);
-            return 2;
-        }
-    }
-    if (iterations == 0) {
-        die("--iterations must be > 0");
-    }
-
-    unsigned char *payload = NULL;
-    if (size > 0) {
-        payload = malloc((size_t)size);
-        if (!payload) {
-            die("payload allocation failed (size=%" PRIu64 ")", size);
-        }
-        fill_payload(payload, (size_t)size);
-    }
-
     int input_fd = prepare_input_fd(payload, (size_t)size);
-
     uint64_t put_elapsed = 0;
     uint64_t get_elapsed = 0;
 
@@ -245,10 +233,152 @@ int main(int argc, char **argv)
         }
     }
 
-    emit_json("put_fd", size, iterations, put_elapsed);
-    emit_json("get_fd", size, iterations, get_elapsed);
-
     close(input_fd);
+    emit_json("memfdbus", "put_fd", size, iterations, put_elapsed);
+    emit_json("memfdbus", "get_fd", size, iterations, get_elapsed);
+}
+
+static void run_unix_stream_bench(uint64_t size, uint64_t iterations,
+                                  const unsigned char *payload)
+{
+    int sv[2];
+    pid_t pid;
+    uint64_t put_elapsed = 0;
+    uint64_t get_elapsed = 0;
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+        die_errno("socketpair");
+    }
+    pid = fork();
+    if (pid < 0) {
+        die_errno("fork");
+    }
+    if (pid == 0) {
+        unsigned char *rbuf = NULL;
+        uint64_t child_elapsed = 0;
+
+        close(sv[0]);
+        if (size > 0) {
+            rbuf = malloc((size_t)size);
+            if (!rbuf) {
+                die("recv buffer allocation failed");
+            }
+        }
+        for (uint64_t i = 0; i < iterations; i++) {
+            uint64_t t0 = now_ns();
+
+            if (size > 0) {
+                read_full_or_die(sv[1], rbuf, (size_t)size);
+            }
+            child_elapsed += now_ns() - t0;
+            if (size > 0 && memcmp(rbuf, payload, (size_t)size) != 0) {
+                die("unix_stream payload mismatch");
+            }
+        }
+        write_full_or_die(sv[1], &child_elapsed, sizeof(child_elapsed));
+        free(rbuf);
+        close(sv[1]);
+        _exit(0);
+    }
+    close(sv[1]);
+    for (uint64_t i = 0; i < iterations; i++) {
+        uint64_t t0 = now_ns();
+
+        if (size > 0) {
+            write_full_or_die(sv[0], payload, (size_t)size);
+        }
+        put_elapsed += now_ns() - t0;
+    }
+    read_full_or_die(sv[0], &get_elapsed, sizeof(get_elapsed));
+    close(sv[0]);
+    if (waitpid(pid, NULL, 0) < 0) {
+        die_errno("waitpid");
+    }
+    emit_json("unix_stream", "send", size, iterations, put_elapsed);
+    emit_json("unix_stream", "recv", size, iterations, get_elapsed);
+}
+
+int main(int argc, char **argv)
+{
+    const char *socket_path = MEMFDBUS_DEFAULT_SOCKET;
+    const char *backend = "all";
+    uint64_t size = 4096;
+    uint64_t iterations = 64;
+    static struct option long_opts[] = {
+        {"socket", required_argument, NULL, 's'},
+        {"size", required_argument, NULL, 'z'},
+        {"iterations", required_argument, NULL, 'n'},
+        {"backend", required_argument, NULL, 'b'},
+        {"help", no_argument, NULL, 'h'},
+        {0, 0, 0, 0},
+    };
+    int opt;
+
+    while ((opt = getopt_long(argc, argv, "s:z:n:b:h", long_opts, NULL)) != -1) {
+        char *end = NULL;
+
+        switch (opt) {
+        case 's':
+            socket_path = optarg;
+            break;
+        case 'z':
+            errno = 0;
+            size = strtoull(optarg, &end, 10);
+            if (errno || !end || *end != '\0') {
+                die("invalid --size: %s", optarg);
+            }
+            break;
+        case 'n':
+            errno = 0;
+            iterations = strtoull(optarg, &end, 10);
+            if (errno || !end || *end != '\0') {
+                die("invalid --iterations: %s", optarg);
+            }
+            break;
+        case 'b':
+            backend = optarg;
+            break;
+        case 'h':
+            usage(argv[0]);
+            return 0;
+        default:
+            usage(argv[0]);
+            return 2;
+        }
+    }
+    if (iterations == 0) {
+        die("--iterations must be > 0");
+    }
+    int run_memfdbus = 0;
+    int run_unix_stream = 0;
+
+    if (strcmp(backend, "memfdbus") == 0) {
+        run_memfdbus = 1;
+    } else if (strcmp(backend, "unix_stream") == 0) {
+        run_unix_stream = 1;
+    } else if (strcmp(backend, "all") == 0) {
+        run_memfdbus = 1;
+        run_unix_stream = 1;
+    } else {
+        die("invalid --backend: %s (expected: memfdbus, unix_stream, all)", backend);
+    }
+
+    unsigned char *payload = NULL;
+    if (size > 0) {
+        payload = malloc((size_t)size);
+        if (!payload) {
+            die("payload allocation failed (size=%" PRIu64 ")", size);
+        }
+        fill_payload(payload, (size_t)size);
+    }
+
+    if (run_memfdbus) {
+        run_memfdbus_bench(socket_path, size, iterations, payload);
+    }
+    if (run_unix_stream) {
+        run_unix_stream_bench(size, iterations, payload);
+    }
+
     free(payload);
     return 0;
 }
