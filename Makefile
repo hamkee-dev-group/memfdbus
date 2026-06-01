@@ -8,6 +8,7 @@ PREFIX ?= /usr/local
 BIN := build/memfdbus
 LIB := build/libmemfdbus.a
 BENCH := build/bench_memfdbus
+BENCH_UDS := build/bench_uds_stream
 BIN_OBJ := build/memfdbus.o
 API_OBJ := build/memfdbus_api.o
 SHA_OBJ := build/sha256.o
@@ -18,11 +19,15 @@ BIN_OBJS := $(BIN_OBJ) $(SHA_OBJ)
 
 all: $(BIN) $(LIB)
 
-bench: $(BENCH)
+bench: $(BENCH) $(BENCH_UDS)
 
 $(BENCH): bench/bench_memfdbus.c $(LIB)
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Iinclude -o $@ bench/bench_memfdbus.c $(LIB) $(LDFLAGS)
+
+$(BENCH_UDS): bench/bench_uds_stream.c
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ bench/bench_uds_stream.c $(LDFLAGS)
 
 build/%.o: src/%.c
 	mkdir -p build
