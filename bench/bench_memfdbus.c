@@ -85,6 +85,9 @@ static void write_full_or_die(int fd, const void *buf, size_t len)
             }
             die_errno("write payload");
         }
+        if (n == 0) {
+            die("write payload: wrote 0 bytes");
+        }
         p += n;
         len -= (size_t)n;
     }
@@ -130,6 +133,9 @@ static int prepare_input_fd(const unsigned char *payload, size_t size)
                     continue;
                 }
                 die_errno("write payload");
+            }
+            if (n == 0) {
+                die("write payload: wrote 0 bytes");
             }
             p += n;
             left -= (size_t)n;
