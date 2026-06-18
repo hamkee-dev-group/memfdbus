@@ -486,10 +486,18 @@ static bool object_can_drop_for_job(const struct object *obj, const char *job_id
     return job_id_matches(obj->owner_job, job_id);
 }
 
-static size_t request_payload_len(const struct mfdb_msg *req)
+static bool request_payload_exceeds(const struct mfdb_msg *req, size_t limit)
 {
-    return (size_t)req->name_len + (size_t)req->text_len +
-           (size_t)req->job_len + (size_t)req->allow_len;
+    const uint32_t parts[] = {req->name_len, req->text_len, req->job_len, req->allow_len};
+    size_t sum = 0;
+
+    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+        if (parts[i] > limit - sum) {
+            return true;
+        }
+        sum += parts[i];
+    }
+    return false;
 }
 
 static void init_msg(struct mfdb_msg *msg, uint16_t cmd)
@@ -1022,7 +1030,7 @@ static void handle_put(int client, struct object_store *store, const struct mfdb
         send_error(client, MFDB_CMD_PUT, MFDB_BAD_REQUEST, "allowed job id too long");
         return;
     }
-    if (request_payload_len(req) > store->max_request_bytes) {
+    if (request_payload_exceeds(req, store->max_request_bytes)) {
         close_nointr(fd);
         broker_log_event_detail("put", "bad_request", 0, NULL, &req->size, NULL, NULL,
                                 "name", "request payload exceeds broker limit", NULL);
@@ -1226,7 +1234,7 @@ static void handle_get(int client, struct object_store *store, const struct mfdb
         send_error(client, MFDB_CMD_GET, MFDB_BAD_REQUEST, "job id too long");
         return;
     }
-    if (request_payload_len(req) > store->max_request_bytes) {
+    if (request_payload_exceeds(req, store->max_request_bytes)) {
         broker_log_event_detail("get", "bad_request", 0, NULL, NULL, NULL, NULL,
                                 "name", "request payload exceeds broker limit", NULL);
         send_error(client, MFDB_CMD_GET, MFDB_BAD_REQUEST,
@@ -1428,7 +1436,7 @@ static void handle_list(int client, struct object_store *store, const struct mfd
         send_error(client, MFDB_CMD_LIST, MFDB_BAD_REQUEST, "job id too long");
         return;
     }
-    if (request_payload_len(req) > store->max_request_bytes) {
+    if (request_payload_exceeds(req, store->max_request_bytes)) {
         broker_log_event_detail("list", "bad_request", 0, NULL, NULL, NULL, NULL,
                                 NULL, "request payload exceeds broker limit", NULL);
         send_error(client, MFDB_CMD_LIST, MFDB_BAD_REQUEST,
@@ -1530,7 +1538,7 @@ static void handle_drop(int client, struct object_store *store, const struct mfd
         send_error(client, MFDB_CMD_DROP, MFDB_BAD_REQUEST, "job id too long");
         return;
     }
-    if (request_payload_len(req) > store->max_request_bytes) {
+    if (request_payload_exceeds(req, store->max_request_bytes)) {
         broker_log_event_detail("drop", "bad_request", 0, NULL, NULL, NULL, NULL,
                                 "name", "request payload exceeds broker limit", NULL);
         send_error(client, MFDB_CMD_DROP, MFDB_BAD_REQUEST,

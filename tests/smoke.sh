@@ -436,7 +436,139 @@ if "$bin" drop --name "$request_over_name" --socket "$request_sock" \
     exit 1
 fi
 grep -F "request payload exceeds broker limit" "$tmp/request-drop.err" >/dev/null
+python3 - "$request_sock" >"$tmp/request-overflow.out" <<'PY'
+import socket
+import struct
+import sys
+
+MAGIC = 0x4d464442
+VERSION = 1
+CMD_LIST = 3
+BAD_REQUEST = 3
+HEADER_FMT = "<IHHIIQQIIII"
+
+header = struct.pack(
+    HEADER_FMT,
+    MAGIC, VERSION, CMD_LIST,
+    0,
+    0,
+    0,
+    0,
+    0xFFFFFFFF,
+    1,
+    0,
+    0,
+)
+assert len(header) == 48
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect(sys.argv[1])
+sock.sendall(header)
+
+resp = b""
+while len(resp) < 48:
+    chunk = sock.recv(48 - len(resp))
+    if not chunk:
+        raise SystemExit("broker closed before sending response header")
+    resp += chunk
+(_, _, _, status, _, _, _, _, text_len, _, _) = struct.unpack(HEADER_FMT, resp)
+text = b""
+while len(text) < text_len:
+    chunk = sock.recv(text_len - len(text))
+    if not chunk:
+        raise SystemExit("broker closed before sending response text")
+    text += chunk
+sock.close()
+
+if status != BAD_REQUEST:
+    raise SystemExit(f"expected BAD_REQUEST status, got {status} ({text!r})")
+expected = b"request payload exceeds broker limit"
+if text != expected:
+    raise SystemExit(f"unexpected error text: {text!r}")
+PY
+"$bin" list --socket "$request_sock" >"$tmp/request-overflow-list.txt"
+grep -F "short" "$tmp/request-overflow-list.txt" >/dev/null
 test "$("$bin" drop --name short --socket "$request_sock")" = "$request_id"
+stop_broker
+python3 - "$request_log" <<'PY'
+import json
+import pathlib
+import sys
+
+records = []
+for raw in pathlib.Path(sys.argv[1]).read_text().splitlines():
+    line = raw.strip()
+    if not line or not line.startswith("{"):
+        continue
+    records.append(json.loads(line))
+
+for record in records:
+    if (record.get("op") == "list" and record.get("result") == "bad_request"
+            and record.get("error") == "request payload exceeds broker limit"):
+        break
+else:
+    raise SystemExit("missing list bad_request audit record for request overflow")
+
+for record in records:
+    if record.get("op") == "list" and record.get("result") == "ok":
+        break
+else:
+    raise SystemExit("missing follow-up list ok audit record")
+PY
+
+default_request_sock="$tmp/request-default.sock"
+default_request_log="$tmp/request-default.log"
+start_broker "$default_request_sock" "$default_request_log"
+python3 - "$default_request_sock" >"$tmp/request-default-overflow.out" <<'PY'
+import socket
+import struct
+import sys
+
+MAGIC = 0x4d464442
+VERSION = 1
+CMD_LIST = 3
+BAD_REQUEST = 3
+HEADER_FMT = "<IHHIIQQIIII"
+
+header = struct.pack(
+    HEADER_FMT,
+    MAGIC, VERSION, CMD_LIST,
+    0,
+    0,
+    0,
+    0,
+    0xFFFFFFFF,
+    1,
+    0,
+    0,
+)
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect(sys.argv[1])
+sock.sendall(header)
+
+resp = b""
+while len(resp) < 48:
+    chunk = sock.recv(48 - len(resp))
+    if not chunk:
+        raise SystemExit("broker closed before sending response header")
+    resp += chunk
+(_, _, _, status, _, _, _, _, text_len, _, _) = struct.unpack(HEADER_FMT, resp)
+text = b""
+while len(text) < text_len:
+    chunk = sock.recv(text_len - len(text))
+    if not chunk:
+        raise SystemExit("broker closed before sending response text")
+    text += chunk
+sock.close()
+
+if status != BAD_REQUEST:
+    raise SystemExit(f"expected BAD_REQUEST status, got {status} ({text!r})")
+expected = b"request payload exceeds broker limit"
+if text != expected:
+    raise SystemExit(f"unexpected error text: {text!r}")
+PY
+"$bin" list --socket "$default_request_sock" >"$tmp/request-default-list.txt"
 stop_broker
 
 list_sock="$tmp/list-limit.sock"
